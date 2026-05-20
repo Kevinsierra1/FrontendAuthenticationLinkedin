@@ -1,0 +1,16 @@
+:root {
+  --linkedin-blue: #0a66c2;
+  --linkedin-blue-hover: #004182;
+  --public-bg: #f3f2ef;
+  --surface: #ffffff;
+  --text: #000000;
+  --muted: #666666;
+  --line: #c9cdd2;
+  --danger: #b42318;
+  --success: #057642;
+  --soft-blue: #eef6ff;
+  --premium: #915907;
+  --radius-card: 8px;
+  --radius-pill: 24px;
+  --font-linkedin: "LinkedIn Sans", -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
