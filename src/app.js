@@ -306,6 +306,47 @@ function googleLoginErrorMessage(error) {
   return "No pudimos iniciar sesion con Google.";
 }
 
+function renderInlineNotice(anchor, message) {
+  const container = anchor?.parentElement || app || document.body;
+  let notice = container.querySelector(".inline-alert");
+
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.className = "inline-alert";
+    notice.setAttribute("role", "alert");
+    notice.setAttribute("aria-live", "polite");
+  }
+
+  notice.textContent = message;
+  if (anchor?.nextElementSibling) {
+    anchor.parentElement.insertBefore(notice, anchor.nextElementSibling);
+  } else {
+    container.appendChild(notice);
+  }
+}
+
+function showComingSoon(provider = "Esta opcion", anchor = null) {
+  const message = `${provider} se implementara pronto.`;
+  renderInlineNotice(anchor, message);
+  renderToast(message);
+}
+
+function bindComingSoonOauthGuard() {
+  document.addEventListener(
+    "click",
+    (event) => {
+      const button = event.target.closest?.('[data-oauth="apple"]');
+      if (!button) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      showComingSoon("Apple", button);
+    },
+    true
+  );
+}
+
 function registerErrorMessage(error) {
   if (!error) return "No pudimos completar el registro.";
   if (error.code === "NETWORK_ERROR") return "Error de red al conectar con backend.";
@@ -517,6 +558,9 @@ function liIcon() {
 
 function oauthButton(provider, label) {
   const icon = provider === "google" ? googleIcon() : provider === "microsoft" ? microsoftIcon() : appleIcon();
+  if (provider === "microsoft") {
+    return `<button class="oauth-btn" type="button">${icon}<span>${label}</span></button>`;
+  }
   return `<button class="oauth-btn" data-oauth="${provider}" type="button">${icon}<span>${label}</span></button>`;
 }
 
@@ -1104,13 +1148,11 @@ function bindPageEvents() {
         return;
       }
 
-      if (location.pathname.startsWith("/register")) {
-        saveRegister({ firstName: "Ximena", lastName: "Afanador", email: demoUser.email });
-        navigate("/register/name");
+      if (provider === "microsoft") {
         return;
       }
 
-      login(demoUser);
+      showComingSoon(provider === "apple" ? "Apple" : "Esta opcion", button);
     });
   });
 
@@ -1295,8 +1337,8 @@ function bindForms() {
 async function handleForm(form) {
   const data = Object.fromEntries(new FormData(form));
   const route = {
-    login: () => requireFields(form, ["email", "password"]) && login({ email: data.email }),
-    welcome: () => requireFields(form, ["password"]) && login(store.remembered),
+    login: () => requireFields(form, ["email", "password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
+    welcome: () => requireFields(form, ["password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
     forgot: () => {
       if (!requireFields(form, ["email"])) return;
       saveForgot({ email: data.email });
@@ -1471,5 +1513,6 @@ function render() {
 
 window.addEventListener("popstate", render);
 window.appLogout = logout;
+bindComingSoonOauthGuard();
 render();
 

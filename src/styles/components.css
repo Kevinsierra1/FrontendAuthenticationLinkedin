@@ -297,6 +297,18 @@ small[data-error] {
   opacity: 1;
   transform: translate(-50%, 0);
 }
+.inline-alert {
+  width: 100%;
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  border: 1px solid #c8d6e5;
+  border-radius: 8px;
+  background: #eef6ff;
+  color: #0a66c2;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: center;
+}
 @media (max-width: 768px) {
   .public-nav {
     height: auto;

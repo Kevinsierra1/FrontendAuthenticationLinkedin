@@ -89,11 +89,17 @@ createServer(async (req, res) => {
 
   try {
     const body = await readFile(filePath);
-    res.writeHead(200, { "Content-Type": types[extname(filePath)] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": types[extname(filePath)] || "application/octet-stream",
+      "Cache-Control": "no-store"
+    });
     res.end(body);
   } catch {
     const body = await readFile(join(root, "index.html"));
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store"
+    });
     res.end(body);
   }
 }).listen(port, () => {
