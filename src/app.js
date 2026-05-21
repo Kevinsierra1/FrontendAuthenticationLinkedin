@@ -22,6 +22,25 @@ const registerSteps = [
   "/register/games"
 ];
 
+const appConfig = window.APP_CONFIG || {};
+const rawApiBaseUrl = appConfig.VITE_API_BASE_URL || "/api";
+const API_BASE_URL = (/^https?:\/\//.test(rawApiBaseUrl) ? "/api" : rawApiBaseUrl).replace(/\/$/, "");
+const GOOGLE_CLIENT_ID = appConfig.VITE_GOOGLE_CLIENT_ID || "";
+const onboardingStepRouteMap = {
+  BasicProfile: "/onboarding/basic-profile",
+  Location: "/onboarding/location",
+  Experience: "/onboarding/experience",
+  JobPreferences: "/onboarding/job-preferences",
+  ProfilePhoto: "/onboarding/profile-photo",
+  PhoneVerification: "/onboarding/phone-verification",
+  Completed: "/feed"
+};
+
+let googleSignInInitialized = false;
+let googleCredentialResolver = null;
+let googleCredentialRejecter = null;
+let hiddenGoogleButtonElement = null;
+
 const store = {
   auth: JSON.parse(localStorage.getItem("tl_auth") || '{"isLoggedIn":false,"user":null}'),
   remembered: JSON.parse(localStorage.getItem("tl_remembered") || "null"),
@@ -50,6 +69,211 @@ function saveForgot(patch) {
   sessionStorage.setItem("tl_forgot", JSON.stringify(store.forgot));
 }
 
+function endpoint(path) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  if (API_BASE_URL.endsWith("/api")) return `${API_BASE_URL}${normalizedPath}`;
+  if (API_BASE_URL === "/api") return `${API_BASE_URL}${normalizedPath}`;
+  return `${API_BASE_URL}/api${normalizedPath}`;
+}
+
+function normalizeUserFromBackend(user = {}) {
+  const fullName = `${user.firstName || ""} ${user.lastName || ""}`.trim();
+  return {
+    ...demoUser,
+    id: user.id,
+    name: fullName || user.email || demoUser.name,
+    email: user.email || demoUser.email,
+    avatar: user.profilePictureUrl || null
+  };
+}
+
+function getOnboardingRoute(onboarding = {}) {
+  if (onboarding.completed || onboarding.currentStep === "Completed") return "/feed";
+  const mappedRoute = onboardingStepRouteMap[onboarding.currentStep];
+  const availableOnboardingRoutes = new Set(["/onboarding"]);
+  return mappedRoute && availableOnboardingRoutes.has(mappedRoute) ? mappedRoute : "/onboarding";
+}
+
+function persistExternalSession(session) {
+  const backendUser = session.user || {};
+  const onboarding = session.onboarding || {};
+  const userForUi = normalizeUserFromBackend(backendUser);
+
+  store.auth = {
+    isLoggedIn: true,
+    accessToken: session.accessToken || "",
+    refreshToken: session.refreshToken || "",
+    user: userForUi,
+    onboarding
+  };
+  saveAuth();
+  saveRemembered(userForUi);
+
+  localStorage.setItem("accessToken", session.accessToken || "");
+  localStorage.setItem("refreshToken", session.refreshToken || "");
+  localStorage.setItem("user", JSON.stringify(backendUser));
+  localStorage.setItem("onboarding", JSON.stringify(onboarding));
+}
+
+async function waitForGoogleIdentity(timeoutMs = 7000) {
+  if (window.google?.accounts?.id) return window.google;
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (window.google?.accounts?.id) {
+        clearInterval(timer);
+        resolve(window.google);
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error("Google login unavailable"));
+      }
+    }, 50);
+  });
+}
+
+function handleGoogleCredentialResponse(credentialResponse) {
+  const idToken = credentialResponse?.credential;
+  if (!googleCredentialResolver || !googleCredentialRejecter) return;
+  if (!idToken) {
+    googleCredentialRejecter(new Error("Google did not return an idToken"));
+  } else {
+    googleCredentialResolver(idToken);
+  }
+  googleCredentialResolver = null;
+  googleCredentialRejecter = null;
+}
+
+async function ensureGoogleSignInClient() {
+  if (!GOOGLE_CLIENT_ID) {
+    throw new Error("Missing Google Client ID");
+  }
+
+  const google = await waitForGoogleIdentity();
+  if (googleSignInInitialized) return google;
+
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleGoogleCredentialResponse,
+    auto_select: false,
+    cancel_on_tap_outside: true,
+    ux_mode: "popup",
+    use_fedcm_for_button: false
+  });
+  googleSignInInitialized = true;
+  return google;
+}
+
+function ensureHiddenGoogleButton(google) {
+  if (hiddenGoogleButtonElement && document.body.contains(hiddenGoogleButtonElement)) {
+    return hiddenGoogleButtonElement;
+  }
+
+  let mount = document.getElementById("google-hidden-button-mount");
+  if (!mount) {
+    mount = document.createElement("div");
+    mount.id = "google-hidden-button-mount";
+    mount.setAttribute("aria-hidden", "true");
+    mount.style.position = "fixed";
+    mount.style.left = "-10000px";
+    mount.style.top = "-10000px";
+    mount.style.width = "280px";
+    mount.style.height = "56px";
+    mount.style.opacity = "0";
+    document.body.appendChild(mount);
+  }
+
+  mount.innerHTML = "";
+  google.accounts.id.renderButton(mount, {
+    type: "standard",
+    theme: "outline",
+    size: "large",
+    text: "continue_with",
+    shape: "pill",
+    logo_alignment: "left",
+    width: 280
+  });
+
+  hiddenGoogleButtonElement = mount.querySelector('[role="button"]') || mount.firstElementChild;
+  if (!hiddenGoogleButtonElement) {
+    throw new Error("Google button unavailable");
+  }
+
+  return hiddenGoogleButtonElement;
+}
+
+async function requestGoogleIdToken() {
+  const google = await ensureGoogleSignInClient();
+  const hiddenButton = ensureHiddenGoogleButton(google);
+  return new Promise((resolve, reject) => {
+    google.accounts.id.cancel();
+
+    const timeout = setTimeout(() => {
+      if (!googleCredentialRejecter) return;
+      googleCredentialRejecter(new Error("Google login cancelled"));
+      googleCredentialResolver = null;
+      googleCredentialRejecter = null;
+    }, 20000);
+
+    googleCredentialResolver = (idToken) => {
+      clearTimeout(timeout);
+      resolve(idToken);
+    };
+    googleCredentialRejecter = (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    };
+
+    hiddenButton.click();
+  });
+}
+
+async function exchangeGoogleIdToken(idToken) {
+  let response;
+  try {
+    response = await fetch(endpoint("/auth/external-login/google"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idToken })
+    });
+  } catch {
+    const error = new Error("Network error");
+    error.code = "NETWORK_ERROR";
+    throw error;
+  }
+
+  const payload = await response.json().catch(() => ({}));
+  if (response.ok) return payload;
+
+  const error = new Error(payload.message || "Google login failed");
+  error.status = response.status;
+  throw error;
+}
+
+function googleLoginErrorMessage(error) {
+  if (!error) return "No pudimos iniciar sesion con Google.";
+  if (error.message === "Google login cancelled") return "Inicio de sesion con Google cancelado.";
+  if (error.message === "Google did not return an idToken") return "Google no devolvio un idToken.";
+  if (error.message === "Google button unavailable") return "No se pudo abrir el selector de cuentas de Google.";
+  if (error.message === "Missing Google Client ID") return "Falta VITE_GOOGLE_CLIENT_ID.";
+  if (error.message === "Google login unavailable") return "Google Identity Services no esta disponible.";
+  if (error.code === "NETWORK_ERROR") return "Error de red al conectar con backend.";
+  if (error.status === 400) return "Solicitud invalida al iniciar sesion con Google.";
+  if (error.status === 401) return "Token de Google invalido o expirado.";
+  if (error.status === 409) return "Conflicto de cuenta al iniciar sesion con Google.";
+  if (error.status === 500) return "Error interno del servidor durante login con Google.";
+  return "No pudimos iniciar sesion con Google.";
+}
+
+async function loginWithGoogle() {
+  const idToken = await requestGoogleIdToken();
+  const session = await exchangeGoogleIdToken(idToken);
+  persistExternalSession(session);
+  const redirectPath = getOnboardingRoute(session.onboarding);
+  navigate(redirectPath);
+}
+
 function login(user = demoUser) {
   store.auth = { isLoggedIn: true, user: { ...demoUser, ...user } };
   saveAuth();
@@ -60,6 +284,10 @@ function login(user = demoUser) {
 function logout() {
   store.auth = { isLoggedIn: false, user: null };
   saveAuth();
+  localStorage.removeItem("accessToken");
+  localStorage.removeItem("refreshToken");
+  localStorage.removeItem("user");
+  localStorage.removeItem("onboarding");
   navigate("/");
 }
 
@@ -670,13 +898,28 @@ function bindPageEvents() {
   });
 
   document.querySelectorAll("[data-oauth]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
+      const provider = button.dataset.oauth;
+
+      if (provider === "google") {
+        button.disabled = true;
+        try {
+          await loginWithGoogle();
+        } catch (error) {
+          renderToast(googleLoginErrorMessage(error));
+        } finally {
+          button.disabled = false;
+        }
+        return;
+      }
+
       if (location.pathname.startsWith("/register")) {
         saveRegister({ firstName: "Ximena", lastName: "Afanador", email: demoUser.email });
         navigate("/register/name");
-      } else {
-        login(demoUser);
+        return;
       }
+
+      login(demoUser);
     });
   });
 
