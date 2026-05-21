@@ -179,11 +179,6 @@ function renderLanding() {
 }
 
 function renderLogin() {
-  if (store.auth.isLoggedIn) {
-    navigate("/feed");
-    return "";
-  }
-
   if (store.remembered) return renderWelcomeBack();
 
   return authCard(`
@@ -770,11 +765,6 @@ function routeView() {
     history.replaceState({}, "", "/login");
     return renderLogin();
   }
-  if ((path === "/login" || path.startsWith("/register")) && store.auth.isLoggedIn) {
-    history.replaceState({}, "", "/feed");
-    return renderFeed();
-  }
-
   const routes = {
     "/": renderLanding,
     "/login": renderLogin,

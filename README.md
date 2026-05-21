@@ -1,22 +1,29 @@
 # FrontendAuthenticationLinkedin
 
-Simulador frontend del proceso de autenticación y registro de LinkedIn construido con HTML5, CSS3 y JavaScript Vanilla ES6+.
+Simulador frontend del proceso de autenticacion y registro de LinkedIn construido con HTML5, CSS3 y JavaScript Vanilla ES6+.
 
 ## Ejecutar
 
 ```powershell
-npm run dev
+pnpm run dev
 ```
 
 Luego abre:
 
 http://localhost:4173
 
+Si pnpm no esta instalado:
+
+```powershell
+corepack enable
+corepack prepare pnpm@10.11.0 --activate
+```
+
 ## Incluye
 
-- Landing pública estilo LinkedIn
+- Landing publica estilo LinkedIn
 - Login normal, OAuth simulado y pantalla "welcome back"
-- Recuperación de contraseña en 4 pasos
+- Recuperacion de contrasena en 4 pasos
 - Registro guiado con barra de progreso y pasos simulados
 - Modal OAuth Google simulado para importar contactos
 - Feed final de LinkedIn en 3 columnas
