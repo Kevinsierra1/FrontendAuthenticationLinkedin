@@ -144,6 +144,7 @@ function avatar(user = demoUser, size = "") {
 function renderLanding() {
   return `
     ${publicNav()}
+    <div class="landing-wrapper">
     <main class="landing-page">
       <section class="landing-copy">
         <h1>¡Te damos la bienvenida a tu comunidad profesional!</h1>
@@ -175,6 +176,7 @@ function renderLanding() {
         </svg>
       </section>
     </main>
+    </div>
   `;
 }
 
@@ -340,8 +342,14 @@ function renderRegisterLocation() {
     <h1>Añade tu ubicación</h1>
     <p class="form-copy">Esto nos ayuda a recomendarte personas, empleos y noticias en tu zona.</p>
     <form data-form="register-location">
-      ${inputField("Ubicación*", "location", "text", store.register.location || "Bucaramanga, Santander, Colombia")}
-      <span class="chip">${store.register.location || "Bucaramanga, Santander, Colombia"}</span>
+      <div class="location-autocomplete">
+        <label class="li-field">
+          <span>Ubicación*</span>
+          <input id="locationInput" name="location" type="text" autocomplete="off" placeholder="Escribe tu ciudad..."/>
+          <small data-error="location"></small>
+        </label>
+        <ul id="locationSuggestions" class="location-dropdown" hidden></ul>
+      </div>
       <button class="btn-primary wide" type="submit">Continuar</button>
     </form>
   `);
@@ -495,7 +503,7 @@ function registeredUser() {
     ...demoUser,
     name,
     email: store.register.email || demoUser.email,
-    headline: `${store.register.jobTitle || "Desarrolladora de Software .NET"} | C# • SQL | Python | JavaScript`,
+    headline: store.register.jobTitle || store.register.degree || "Profesional",
     location: store.register.location || demoUser.location,
     company: store.register.company || demoUser.company
   };
@@ -573,7 +581,22 @@ function appNav(active = "") {
   return `
     <header class="app-nav">
       <div class="app-brand">${liIcon()}<label><span>⌕</span><input placeholder="Buscar"/></label></div>
-      <nav>${items.map(([label, href, icon]) => `<a class="${label.startsWith(active) ? "active" : ""}" href="${href}" ${href !== "#" ? "data-link" : ""}><i>${icon}</i><span>${label}</span>${label === "Notificaciones" ? "<b>1</b>" : ""}</a>`).join("")}</nav>
+      <nav>${items.map(([label, href, icon]) => {
+        if (href === "/profile/me") {
+          return `
+            <div class="nav-dropdown-wrap">
+              <a class="nav-yo ${label.startsWith(active) ? "active" : ""}" href="${href}" data-link>
+                <i>${icon}</i><span>${label}</span>
+              </a>
+              <div class="nav-dropdown">
+                <a href="/profile/me" data-link>Ver perfil</a>
+                <hr/>
+                <button data-action="logout">Cerrar sesión</button>
+              </div>
+            </div>`;
+        }
+        return `<a class="${label.startsWith(active) ? "active" : ""}" href="${href}" ${href !== "#" ? "data-link" : ""}><i>${icon}</i><span>${label}</span>${label === "Notificaciones" ? "<b>1</b>" : ""}</a>`;
+      }).join("")}</nav>
       <a class="premium" href="#">Probar Premium por 0 COP</a>
     </header>
   `;
@@ -587,11 +610,11 @@ function renderProfile() {
       <section class="profile-main card">
         <div class="profile-cover"></div>
         <button class="avatar-plus profile-avatar">${avatar(user, "xl")}<b>+</b></button>
-        <button class="edit-btn">✎</button>
+        <button class="edit-btn" data-action="edit-profile">✎</button>
         <div class="profile-info">
           <h1>${user.name}</h1>
           <a class="verify-link" href="#">✔ Añadir insignia de verificación</a>
-          <p>${user.headline} | HTML y CSS | IA</p>
+          <p id="profileHeadline" data-editable="headline">${user.headline} | HTML y CSS | IA</p>
           <small>${user.location} · <a href="#">Información de contacto</a></small>
           <div class="profile-actions"><button class="btn-primary">Tengo interés en...</button><button class="btn-outline">Añadir sección</button><button class="btn-outline">Mejorar perfil</button><button class="btn-outline">...</button></div>
         </div>
@@ -677,6 +700,84 @@ function bindPageEvents() {
     render();
   });
   document.querySelector('[data-action="google-account"]')?.addEventListener("click", () => navigate("/register/app-download"));
+  document.querySelector('[data-action="logout"]')?.addEventListener("click", logout);
+
+  if (location.pathname === "/register/location") {
+    const locationInput = document.getElementById("locationInput");
+    const suggestionsList = document.getElementById("locationSuggestions");
+
+    if (locationInput && suggestionsList) {
+      locationInput.value = store.register.location || "";
+
+      let debounceTimer;
+      locationInput.addEventListener("input", () => {
+        clearTimeout(debounceTimer);
+        const query = locationInput.value.trim();
+        if (query.length < 3) {
+          suggestionsList.hidden = true;
+          return;
+        }
+        debounceTimer = setTimeout(() => {
+          fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=5&addressdetails=1`, {
+            headers: { "Accept-Language": "es" }
+          })
+            .then((response) => response.json())
+            .then((results) => {
+              suggestionsList.innerHTML = "";
+              if (!results.length) {
+                suggestionsList.hidden = true;
+                return;
+              }
+              results.forEach((place) => {
+                const li = document.createElement("li");
+                li.textContent = place.display_name;
+                li.addEventListener("click", () => {
+                  locationInput.value = place.display_name;
+                  suggestionsList.hidden = true;
+                  saveRegister({ location: place.display_name });
+                });
+                suggestionsList.appendChild(li);
+              });
+              suggestionsList.hidden = false;
+            });
+        }, 400);
+      });
+
+      document.addEventListener("click", (event) => {
+        if (!event.target.closest(".location-autocomplete")) suggestionsList.hidden = true;
+      });
+    }
+  }
+
+  document.querySelector('[data-action="edit-profile"]')?.addEventListener("click", () => {
+    const el = document.getElementById("profileHeadline");
+    if (!el || el.querySelector("textarea")) return;
+
+    const original = el.textContent.trim();
+    el.innerHTML = `
+      <textarea class="edit-textarea">${original}</textarea>
+      <div class="edit-actions">
+        <button class="btn-primary" data-action="save-headline">Guardar</button>
+        <button class="btn-outline" data-action="cancel-headline">Cancelar</button>
+      </div>`;
+
+    document.querySelector('[data-action="save-headline"]').addEventListener("click", () => {
+      const newVal = el.querySelector("textarea").value.trim() || original;
+      if (store.auth.user) {
+        store.auth.user.headline = newVal;
+        saveAuth();
+      }
+      el.innerHTML = newVal;
+    });
+
+    document.querySelector('[data-action="cancel-headline"]').addEventListener("click", () => {
+      el.innerHTML = original;
+    });
+  });
+
+  document.querySelector(".profile-actions .btn-outline:nth-child(3)")?.addEventListener("click", () => {
+    document.querySelector('[data-action="edit-profile"]')?.click();
+  });
 
   bindForms();
 }
