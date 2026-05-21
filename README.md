@@ -21,17 +21,12 @@ corepack prepare pnpm@10.11.0 --activate
 
 ## Conexion con backend local
 
-Este frontend usa por defecto:
+Configura variables de entorno en `.env` (ver `.env.example`):
 
-- `API_BASE_URL: /api`
-- `USE_MOCK: false`
-- `FALLBACK_TO_MOCK: true`
+- `VITE_GOOGLE_CLIENT_ID`
+- `VITE_API_BASE_URL=http://localhost:5152`
 
-La configuracion vive en `src/core/config/env.js`.
-
-El servidor de desarrollo (`server.mjs`) hace proxy de `/api/*` hacia:
-
-- `BACKEND_URL=http://localhost:5152` (valor por defecto)
+El servidor de desarrollo (`server.mjs`) expone esas variables en runtime (`/env.js`) y proxea `/api/*` al backend para evitar problemas de CORS.
 
 Backend esperado:
 
@@ -51,4 +46,8 @@ Backend esperado:
 
 ## Flujos incluidos
 
-Conecta con API real cuando existe el endpoint y cae a flujo mock cuando el endpoint aun no esta disponible.
+Google OAuth usa token real de Google y lo intercambia con:
+
+- `POST /api/auth/external-login/google`
+
+El backend responde `accessToken`/`refreshToken` internos y esos son los tokens usados por la sesion de la app.

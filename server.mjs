@@ -8,11 +8,16 @@ const root = process.cwd();
 loadEnvFile(join(root, ".env"));
 
 const port = Number(process.env.PORT || 4173);
-const configuredApiBaseUrl = (process.env.VITE_API_BASE_URL || process.env.BACKEND_URL || "http://localhost:5152").replace(/\/$/, "");
+const configuredApiBaseUrl = (
+  process.env.VITE_API_BASE_URL ||
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.BACKEND_URL ||
+  "http://localhost:5152"
+).replace(/\/$/, "");
 const backendUrl = configuredApiBaseUrl.endsWith("/api")
   ? configuredApiBaseUrl.slice(0, -4)
   : configuredApiBaseUrl;
-const googleClientId = process.env.VITE_GOOGLE_CLIENT_ID || "";
+const googleClientId = process.env.VITE_GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
 
 function loadEnvFile(path) {
   if (!existsSync(path)) return;
@@ -42,7 +47,7 @@ createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/env.js") {
-    const envScript = `window.APP_CONFIG = { ...(window.APP_CONFIG || {}), VITE_API_BASE_URL: ${JSON.stringify(configuredApiBaseUrl)}, VITE_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)} };`;
+    const envScript = `window.APP_CONFIG = { ...(window.APP_CONFIG || {}), VITE_API_BASE_URL: ${JSON.stringify(configuredApiBaseUrl)}, NEXT_PUBLIC_API_BASE_URL: ${JSON.stringify(configuredApiBaseUrl)}, VITE_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)}, NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)} };`;
     res.writeHead(200, {
       "Content-Type": "text/javascript; charset=utf-8",
       "Cache-Control": "no-store"
