@@ -8,16 +8,14 @@ const root = process.cwd();
 loadEnvFile(join(root, ".env"));
 
 const port = Number(process.env.PORT || 4173);
-const configuredApiBaseUrl = (
-  process.env.VITE_API_BASE_URL ||
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
+const backendUrl = (
+  process.env.VITE_BACKEND_URL ||
   process.env.BACKEND_URL ||
   "http://localhost:5152"
 ).replace(/\/$/, "");
-const backendUrl = configuredApiBaseUrl.endsWith("/api")
-  ? configuredApiBaseUrl.slice(0, -4)
-  : configuredApiBaseUrl;
 const googleClientId = process.env.VITE_GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
+const microsoftClientId =
+  process.env.VITE_MICROSOFT_CLIENT_ID || process.env.NEXT_PUBLIC_MICROSOFT_CLIENT_ID || "";
 
 function loadEnvFile(path) {
   if (!existsSync(path)) return;
@@ -40,14 +38,42 @@ const types = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml"
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon"
 };
 
-createServer(async (req, res) => {
+async function readStaticAsset(requestedPath) {
+  const relativePath = requestedPath.replace(/^\//, "");
+  const rootDir = normalize(root);
+  const candidates = [
+    join(rootDir, relativePath),
+    join(rootDir, "public", relativePath)
+  ];
+
+  for (const filePath of candidates) {
+    const normalizedPath = normalize(filePath);
+    if (!normalizedPath.startsWith(rootDir)) continue;
+    try {
+      return await readFile(normalizedPath);
+    } catch {
+      // Try next location.
+    }
+  }
+
+  throw new Error("Asset not found");
+}
+
+const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/env.js") {
-    const envScript = `window.APP_CONFIG = { ...(window.APP_CONFIG || {}), VITE_API_BASE_URL: ${JSON.stringify(configuredApiBaseUrl)}, NEXT_PUBLIC_API_BASE_URL: ${JSON.stringify(configuredApiBaseUrl)}, VITE_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)}, NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)} };`;
+    const apiBaseUrl = (process.env.VITE_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "/api").replace(/\/$/, "");
+    const backendPublicUrl = (process.env.VITE_BACKEND_URL || process.env.BACKEND_URL || backendUrl).replace(/\/$/, "");
+    const envScript = `window.APP_CONFIG = { ...(window.APP_CONFIG || {}), VITE_API_BASE_URL: ${JSON.stringify(apiBaseUrl)}, NEXT_PUBLIC_API_BASE_URL: ${JSON.stringify(apiBaseUrl)}, VITE_BACKEND_URL: ${JSON.stringify(backendPublicUrl)}, NEXT_PUBLIC_BACKEND_URL: ${JSON.stringify(backendPublicUrl)}, VITE_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)}, NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${JSON.stringify(googleClientId)}, VITE_MICROSOFT_CLIENT_ID: ${JSON.stringify(microsoftClientId)}, NEXT_PUBLIC_MICROSOFT_CLIENT_ID: ${JSON.stringify(microsoftClientId)} };`;
     res.writeHead(200, {
       "Content-Type": "text/javascript; charset=utf-8",
       "Cache-Control": "no-store"
@@ -85,10 +111,10 @@ createServer(async (req, res) => {
   }
 
   const requested = url.pathname === "/" ? "/index.html" : url.pathname;
-  const filePath = normalize(join(root, requested));
+  const filePath = normalize(join(root, requested.replace(/^\//, "")));
 
   try {
-    const body = await readFile(filePath);
+    const body = await readStaticAsset(requested);
     res.writeHead(200, {
       "Content-Type": types[extname(filePath)] || "application/octet-stream",
       "Cache-Control": "no-store"
@@ -102,6 +128,18 @@ createServer(async (req, res) => {
     });
     res.end(body);
   }
-}).listen(port, () => {
+});
+
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(
+      `Puerto ${port} en uso. Cierra el otro servidor (pnpm dev) o ejecuta: taskkill //PID <pid> //F`
+    );
+    process.exit(1);
+  }
+  throw error;
+});
+
+server.listen(port, () => {
   console.log(`Professional Network running at http://localhost:${port}`);
 });

@@ -1,15 +1,61 @@
 const runtimeConfig = window.APP_CONFIG || {};
 
-const rawApiBaseUrl = (
-  runtimeConfig.VITE_API_BASE_URL ||
-  runtimeConfig.NEXT_PUBLIC_API_BASE_URL ||
-  "http://localhost:5152"
-).replace(/\/$/, "");
+function resolveApiBaseUrl() {
+  const configured = (
+    runtimeConfig.VITE_API_BASE_URL ||
+    runtimeConfig.NEXT_PUBLIC_API_BASE_URL ||
+    ""
+  )
+    .trim()
+    .replace(/\/$/, "");
+
+  if (configured) return configured;
+
+  if (typeof window !== "undefined" && window.location?.origin) {
+    return "/api";
+  }
+
+  return "http://localhost:5152";
+}
+
+const rawApiBaseUrl = resolveApiBaseUrl();
 
 function resolveApiUrl(path) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   if (rawApiBaseUrl.endsWith("/api")) return `${rawApiBaseUrl}${normalizedPath}`;
   return `${rawApiBaseUrl}/api${normalizedPath}`;
+}
+
+export function pickResponseValue(payload, camelName, pascalName) {
+  return payload?.[camelName] ?? payload?.[pascalName];
+}
+
+export function normalizeAuthSession(payload) {
+  const user = pickResponseValue(payload, "user", "User") || {};
+  const onboarding = pickResponseValue(payload, "onboarding", "Onboarding") || {};
+
+  return {
+    accessToken: pickResponseValue(payload, "accessToken", "AccessToken") || "",
+    refreshToken: pickResponseValue(payload, "refreshToken", "RefreshToken") || "",
+    isNewUser: Boolean(pickResponseValue(payload, "isNewUser", "IsNewUser")),
+    verificationCodeSent: Boolean(
+      pickResponseValue(payload, "verificationCodeSent", "VerificationCodeSent")
+    ),
+    verificationMessage:
+      pickResponseValue(payload, "verificationMessage", "VerificationMessage") || "",
+    user: {
+      id: pickResponseValue(user, "id", "Id"),
+      email: pickResponseValue(user, "email", "Email") || "",
+      firstName: pickResponseValue(user, "firstName", "FirstName") || "",
+      lastName: pickResponseValue(user, "lastName", "LastName") || "",
+      profilePictureUrl:
+        pickResponseValue(user, "profilePictureUrl", "ProfilePictureUrl") || null
+    },
+    onboarding: {
+      completed: Boolean(pickResponseValue(onboarding, "completed", "Completed")),
+      currentStep: pickResponseValue(onboarding, "currentStep", "CurrentStep") || ""
+    }
+  };
 }
 
 function toApiError(status, payload, fallbackMessage) {
@@ -36,6 +82,13 @@ async function requestJson(path, options, fallbackMessage) {
 
   const payload = await response.json().catch(() => ({}));
   if (response.ok) return payload;
+  if (response.status === 502) {
+    throw toApiError(
+      response.status,
+      { detail: "El backend no esta disponible. Inicia la API .NET en el puerto 5152." },
+      fallbackMessage
+    );
+  }
   throw toApiError(response.status, payload, fallbackMessage);
 }
 
@@ -66,7 +119,7 @@ export async function postExternalLogin(provider, idToken) {
     throw toApiError(400, {}, `Missing ${provider} idToken`);
   }
 
-  return requestJson(
+  const payload = await requestJson(
     `/auth/external-login/${provider}`,
     {
       method: "POST",
@@ -75,6 +128,8 @@ export async function postExternalLogin(provider, idToken) {
     },
     `${provider} login failed`
   );
+
+  return normalizeAuthSession(payload);
 }
 
 export async function postGoogleExternalLogin(idToken) {
@@ -82,7 +137,7 @@ export async function postGoogleExternalLogin(idToken) {
 }
 
 export async function registerLocalAccount(payload) {
-  return requestJson(
+  const response = await requestJson(
     "/auth/register/local",
     {
       method: "POST",
@@ -91,6 +146,22 @@ export async function registerLocalAccount(payload) {
     },
     "Local register failed"
   );
+
+  return normalizeAuthSession(response);
+}
+
+export async function loginLocalAccount(payload) {
+  const response = await requestJson(
+    "/auth/login/local",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    },
+    "Local login failed"
+  );
+
+  return normalizeAuthSession(response);
 }
 
 export async function updateLocalRegisterProfile(payload) {
@@ -105,13 +176,16 @@ export async function updateLocalRegisterProfile(payload) {
   );
 }
 
-export async function sendEmailVerificationCode(userId) {
+export async function sendEmailVerificationCode(userId, email = "") {
   return requestJson(
     "/auth/email-verification/send",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId })
+      body: JSON.stringify({
+        userId,
+        email: email?.trim() || undefined
+      })
     },
     "Email verification send failed"
   );

@@ -1,6 +1,8 @@
 ﻿import {
   cancelIncompleteRegistration,
+  loginLocalAccount,
   postExternalLogin,
+  registerLocalAccount,
   sendEmailVerificationCode,
   updateLocalRegisterProfile,
   uploadProfilePhoto,
@@ -9,14 +11,26 @@
 import {
   buildProviderRegisterDraft,
   getPostLoginRoute,
-  shouldContinueRegistration
+  shouldContinueRegistration,
+  shouldShowEmailVerificationStep
 } from "./core/auth/authFlow.js";
 import {
-  getPendingOnboardingRoute as resolvePendingOnboardingRoute,
+  advanceRegisterProgress,
+  enforceRegisterPath,
+  getMinimumRegisterPath,
+  getRequiredRegisterPath,
+  getRouteAfterExperience
+} from "./core/auth/registerFlow.js";
+import {
   privateRoutes,
   registerSteps,
   shouldKeepLoggedInUserInApp
 } from "./core/auth/onboardingFlow.js";
+import {
+  getNextPostVerifyStep,
+  isPostVerifyRegisterStep,
+  markPostVerifyFlowStarted
+} from "./core/auth/registerPostVerifyFlow.js";
 import {
   clearAuthStorage,
   persistAuth,
@@ -38,11 +52,19 @@ const demoUser = {
 
 const appConfig = window.APP_CONFIG || {};
 const API_MEDIA_BASE_URL = (
+  appConfig.VITE_BACKEND_URL ||
+  appConfig.NEXT_PUBLIC_BACKEND_URL ||
   appConfig.VITE_API_BASE_URL ||
   appConfig.NEXT_PUBLIC_API_BASE_URL ||
   "http://localhost:5152"
-).replace(/\/$/, "");
+)
+  .replace(/\/$/, "")
+  .replace(/\/api$/, "");
 const GOOGLE_CLIENT_ID = appConfig.VITE_GOOGLE_CLIENT_ID || appConfig.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
+const MICROSOFT_CLIENT_ID =
+  appConfig.VITE_MICROSOFT_CLIENT_ID || appConfig.NEXT_PUBLIC_MICROSOFT_CLIENT_ID || "";
+
+let msalInstance = null;
 
 let googleSignInInitialized = false;
 let googleCredentialResolver = null;
@@ -95,27 +117,41 @@ function resolveProfileImageUrl(url) {
   return `${API_MEDIA_BASE_URL}${normalizedPath}`;
 }
 
+function hasActiveRegisterSession() {
+  return Boolean(store.auth?.isLoggedIn && store.auth?.user?.id);
+}
+
 function hasProviderRegisterSession() {
   const authSource = store.register?.authSource;
-  return Boolean(store.auth?.isLoggedIn && store.auth?.user?.id && authSource && authSource !== "local");
+  return Boolean(hasActiveRegisterSession() && authSource && authSource !== "local");
+}
+
+function hasLocalRegisterSession() {
+  return Boolean(hasActiveRegisterSession() && store.register?.authSource === "local");
 }
 
 function getPendingOnboardingRoute() {
-  return resolvePendingOnboardingRoute(store.auth, "/profile/me");
+  if (!store.auth?.isLoggedIn || store.auth.onboarding?.completed) return null;
+  return getMinimumRegisterPath(store.register, store.auth);
+}
+
+function beginPostVerifyFlow(targetPath = "/register/job-search") {
+  startPostVerifyRegistrationFlow();
+  navigate(targetPath);
 }
 
 function persistExternalSession(session) {
-  const backendUser = session.user || {};
-  const onboarding = session.onboarding || {};
+  const backendUser = session?.user || {};
+  const onboarding = session?.onboarding || {};
   const userForUi = normalizeUserFromBackend(backendUser);
 
   store.auth = {
     isLoggedIn: true,
-    accessToken: session.accessToken || "",
-    refreshToken: session.refreshToken || "",
+    accessToken: session?.accessToken || "",
+    refreshToken: session?.refreshToken || "",
     user: userForUi,
     onboarding,
-    isNewUser: Boolean(session.isNewUser)
+    isNewUser: Boolean(session?.isNewUser)
   };
   saveAuth();
   saveRemembered(userForUi);
@@ -294,16 +330,64 @@ function renderInlineNotice(anchor, message) {
   }
 }
 
-function showComingSoon(provider = "Esta opcion", anchor = null) {
-  const message = `${provider} se implementara pronto.`;
-  renderInlineNotice(anchor, message);
-  renderToast(message);
+function implementationBanner(feature = "Esta opción") {
+  return `<p class="implementation-banner" role="status"><strong>${feature} está en implementación.</strong> Por ahora usa <strong>Google</strong> o <strong>registro con email</strong>.</p>`;
 }
 
-function showEmailRegistrationUnavailable(anchor = null) {
-  const message = "El registro con email necesita SMTP configurado. Por ahora usa Continuar con Google.";
+function showUnderImplementation(feature = "Esta opción", anchor = null) {
+  const message = `${feature} está en implementación. Usa Google o email.`;
   renderInlineNotice(anchor, message);
-  renderToast(message);
+}
+
+function showComingSoon(provider = "Esta opción", anchor = null) {
+  showUnderImplementation(provider, anchor);
+}
+
+function buildLocalRegisterPayload(firstName, lastName) {
+  return {
+    email: (store.register.email || "").trim(),
+    password: store.register.password || "",
+    firstName: (firstName || "").trim(),
+    lastName: (lastName || "").trim(),
+    location: null,
+    isStudent: false,
+    jobTitle: null,
+    company: null,
+    university: null,
+    degree: null,
+    discipline: null,
+    startYear: null,
+    jobSearchStatus: null,
+    preferredTitles: [],
+    preferredLocations: [],
+    remoteInterested: false,
+    jobAlertsEnabled: true,
+    recruiterVisibility: true
+  };
+}
+
+async function completeLocalLogin(email, password, remember = true) {
+  const session = await loginLocalAccount({
+    email: email.trim(),
+    password
+  });
+  persistExternalSession(session);
+  replaceRegister({
+    authSource: "local",
+    email: session.user.email,
+    firstName: session.user.firstName || "",
+    lastName: session.user.lastName || ""
+  });
+  if (remember) saveRemembered(normalizeUserFromBackend(session.user));
+  const nextRoute = getPostLoginRoute(session, "/profile/me", store.register);
+  if (isPostVerifyRegisterStep(nextRoute)) {
+    startPostVerifyRegistrationFlow();
+  }
+  navigate(nextRoute);
+}
+
+function isConfiguredClientId(value) {
+  return Boolean(value && !String(value).startsWith("REPLACE_WITH_"));
 }
 
 function bindComingSoonOauthGuard() {
@@ -347,21 +431,60 @@ async function sendCurrentVerificationCode(force = false) {
     return true;
   }
 
-  const response = await sendEmailVerificationCode(userId);
+  const response = await sendEmailVerificationCode(
+    userId,
+    store.register.email || store.auth?.user?.email || ""
+  );
   const onboarding = responseValue(response, "onboarding", "Onboarding");
   const alreadyVerified = Boolean(responseValue(response, "alreadyVerified", "AlreadyVerified"));
+  const codeSent = responseValue(response, "codeSent", "CodeSent") !== false;
+  const apiMessage = responseValue(response, "message", "Message");
 
   saveRegister({ verificationCodeSentFor: userId });
-  persistOnboardingState(onboarding);
+  if (onboarding && (onboarding.completed !== undefined || onboarding.currentStep)) {
+    persistOnboardingState(normalizeOnboardingStatus({ onboarding }));
+  }
 
   if (alreadyVerified) {
     renderToast("Tu email ya estaba verificado.");
+    persistOnboardingState({
+      completed: false,
+      currentStep: "JobPreferences"
+    });
+    saveRegister({
+      ...markPostVerifyFlowStarted(store.register),
+      ...advanceRegisterProgress("/register/verify-email", store.register)
+    });
     navigate("/register/job-search");
     return true;
   }
 
-  renderToast(force ? "Codigo reenviado al correo." : "Codigo enviado al correo.");
+  if (!codeSent) {
+    renderToast(apiMessage || "No se pudo enviar el codigo al correo.");
+    return false;
+  }
+
+  showVerificationDeliveryHint(apiMessage);
+  renderToast(force ? "Codigo reenviado." : "Codigo enviado. Revisa tu correo.");
   return true;
+}
+
+function showVerificationDeliveryHint(apiMessage) {
+  const form = document.querySelector('form[data-form="register-verify"]');
+  if (!form) return;
+
+  let hint = form.querySelector("[data-verification-hint]");
+  if (!hint) {
+    hint = document.createElement("p");
+    hint.className = "verification-hint";
+    hint.setAttribute("data-verification-hint", "");
+    hint.setAttribute("role", "status");
+    form.querySelector(".code-input")?.insertAdjacentElement("afterend", hint);
+  }
+
+  hint.hidden = false;
+  hint.textContent =
+    apiMessage || "Revisa tu bandeja de entrada y la carpeta de spam. El codigo solo llega por correo.";
 }
 
 function persistUploadedProfilePhoto(profilePictureUrl) {
@@ -404,10 +527,23 @@ function splitCsvList(value = "") {
     .filter(Boolean);
 }
 
-function buildLocalProfileUpdatePayload() {
-  const authUserId = store.auth?.user?.id;
+function normalizeOnboardingStatus(payload) {
+  const nested = payload?.onboarding || payload?.Onboarding || payload || {};
   return {
+    completed: Boolean(responseValue(nested, "completed", "Completed")),
+    currentStep: responseValue(nested, "currentStep", "CurrentStep") || ""
+  };
+}
+
+function buildLocalProfileUpdatePayload({ completeOnboarding = false } = {}) {
+  const authUserId = store.auth?.user?.id;
+  const jobSearchAnswered = Boolean((store.register.jobSearch || "").trim());
+  const preferredJobs = splitCsvList(store.register.preferredJobs || "");
+  const preferredLocations = splitCsvList(store.register.jobLocations || "");
+
+  const payload = {
     userId: authUserId,
+    completeOnboarding,
     firstName: (store.register.firstName || "").trim() || null,
     lastName: (store.register.lastName || "").trim() || null,
     location: (store.register.location || "").trim() || null,
@@ -418,18 +554,104 @@ function buildLocalProfileUpdatePayload() {
     degree: (store.register.degree || "").trim() || null,
     discipline: (store.register.discipline || "").trim() || null,
     startYear: store.register.startYear ? Number(store.register.startYear) : null,
-    jobSearchStatus: parseJobSearchStatus(store.register.jobSearch || ""),
-    preferredTitles: splitCsvList(store.register.preferredJobs || ""),
-    preferredLocations: splitCsvList(store.register.jobLocations || ""),
+    preferredTitles: preferredJobs,
+    preferredLocations,
     remoteInterested: Boolean(store.register.remote),
     jobAlertsEnabled: true,
     recruiterVisibility: true
   };
+
+  if (jobSearchAnswered) {
+    payload.jobSearchStatus = parseJobSearchStatus(store.register.jobSearch);
+  } else if (preferredJobs.length && preferredLocations.length) {
+    payload.jobSearchStatus = parseJobSearchStatus(store.register.jobSearch || "Sí");
+  }
+
+  return payload;
+}
+
+function startPostVerifyRegistrationFlow() {
+  saveRegister(markPostVerifyFlowStarted(store.register));
+}
+
+function goToNextPostVerifyStep(currentPath, options = {}) {
+  const nextPath = getNextPostVerifyStep(currentPath, options);
+  saveRegister(advanceRegisterProgress(currentPath, store.register));
+  navigate(nextPath);
+}
+
+async function waitForMsal(timeoutMs = 7000) {
+  if (window.msal?.PublicClientApplication) return window.msal;
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (window.msal?.PublicClientApplication) {
+        clearInterval(timer);
+        resolve(window.msal);
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error("Microsoft login unavailable"));
+      }
+    }, 50);
+  });
+}
+
+async function ensureMsalClient() {
+  if (!isConfiguredClientId(MICROSOFT_CLIENT_ID)) {
+    throw new Error("Missing Microsoft Client ID");
+  }
+
+  const msal = await waitForMsal();
+  if (msalInstance) return msalInstance;
+
+  msalInstance = new msal.PublicClientApplication({
+    auth: {
+      clientId: MICROSOFT_CLIENT_ID,
+      authority: "https://login.microsoftonline.com/common",
+      redirectUri: window.location.origin
+    },
+    cache: {
+      cacheLocation: "sessionStorage"
+    }
+  });
+  await msalInstance.initialize();
+  return msalInstance;
+}
+
+async function requestMicrosoftIdToken() {
+  const client = await ensureMsalClient();
+  const response = await client.loginPopup({
+    scopes: ["openid", "profile", "email", "User.Read"]
+  });
+  const idToken = response?.idToken;
+  if (!idToken) {
+    throw new Error("Microsoft did not return an idToken");
+  }
+  return idToken;
 }
 
 async function requestProviderIdToken(provider) {
   if (provider === "google") return requestGoogleIdToken();
+  if (provider === "microsoft") return requestMicrosoftIdToken();
   throw new Error(`${provider} login unavailable`);
+}
+
+function microsoftLoginErrorMessage(error) {
+  if (!error) return "No pudimos iniciar sesion con Microsoft.";
+  if (error.message === "Missing Microsoft Client ID") {
+    return "Microsoft está en implementación (falta configurar el Client ID).";
+  }
+  if (error.message === "Microsoft login unavailable") {
+    return "Microsoft Identity no está disponible.";
+  }
+  if (error.message === "Microsoft did not return an idToken") {
+    return "Microsoft no devolvió un idToken.";
+  }
+  if (error.code === "NETWORK_ERROR") return "Error de red al conectar con el backend.";
+  if (error.status === 401) return "Token de Microsoft inválido o expirado.";
+  return error.message || "No pudimos iniciar sesion con Microsoft.";
 }
 
 async function loginWithProvider(provider) {
@@ -438,8 +660,19 @@ async function loginWithProvider(provider) {
   persistExternalSession(session);
   if (shouldContinueRegistration(session)) {
     syncRegisterFromProviderSession(session, provider);
+    if (session.verificationCodeSent) {
+      renderToast(
+        "Registro iniciado. Tras ubicacion y experiencia, revisa tu correo para el codigo de verificacion."
+      );
+    } else if (session.verificationMessage) {
+      renderToast(session.verificationMessage);
+    }
   }
-  navigate(getPostLoginRoute(session, "/profile/me"));
+  const nextRoute = getPostLoginRoute(session, "/profile/me", store.register);
+  if (isPostVerifyRegisterStep(nextRoute)) {
+    startPostVerifyRegistrationFlow();
+  }
+  navigate(nextRoute);
 }
 
 function login(user = demoUser) {
@@ -515,9 +748,6 @@ function liIcon() {
 
 function oauthButton(provider, label) {
   const icon = provider === "google" ? googleIcon() : provider === "microsoft" ? microsoftIcon() : appleIcon();
-  if (provider === "microsoft") {
-    return `<button class="oauth-btn" type="button">${icon}<span>${label}</span></button>`;
-  }
   return `<button class="oauth-btn" data-oauth="${provider}" type="button">${icon}<span>${label}</span></button>`;
 }
 
@@ -644,7 +874,8 @@ function renderForgot() {
       <section class="wide-card">
         <h1>¿Has olvidado tu contraseña?</h1>
         <p class="form-copy">Enviaremos un código de verificación a este email o número de teléfono si coincide con una cuenta de LinkedIn existente.</p>
-        <form data-form="forgot">
+        ${implementationBanner("La recuperación de contraseña")}
+        <form data-form="forgot" class="email-registration-section">
           ${inputField("Email o teléfono", "email")}
           <button class="btn-primary wide" type="submit">Siguiente</button>
           <button class="text-btn" type="button" data-back="/login">Volver</button>
@@ -720,7 +951,7 @@ function registerShell(content, options = {}) {
 }
 
 function navButtons(back, disabled = false, label = "Continuar") {
-  return `<div class="step-actions"><a class="back-circle" href="${back}" data-link>&larr;</a><button class="btn-primary" ${disabled ? "disabled" : ""}>${label}</button></div>`;
+  return `<div class="step-actions"><a class="back-circle" href="${back}" data-link>&larr;</a><button class="btn-primary" type="submit" ${disabled ? "disabled" : ""}>${label}</button></div>`;
 }
 
 function renderRegisterStart() {
@@ -803,11 +1034,13 @@ function professionalFields() {
 }
 
 function renderRegisterVerifyEmail() {
+  const targetEmail = store.register.email || store.auth?.user?.email || demoUser.email;
   return registerShell(`
     <h1>Verifica tu email</h1>
-    <p class="form-copy">Introduce el código de 6 dígitos que te hemos enviado a: ${store.register.email || demoUser.email}</p>
+    <p class="form-copy">Introduce el código de 6 dígitos que te hemos enviado a: ${targetEmail}</p>
     <form data-form="register-verify">
-      <input class="code-input" name="code" maxlength="6" placeholder="Código de seis dígitos"/>
+      <input class="code-input" name="code" maxlength="6" placeholder="Código de seis dígitos" inputmode="numeric"/>
+      <p class="verification-hint" data-verification-hint hidden></p>
       <small data-error="code"></small>
       <button class="oauth-btn wide" type="button" data-action="resend-code">Reenviar código</button>
       <details class="privacy-box"><summary>&#128737; Tu privacidad es muy importante</summary><p>Controlas cómo se usa tu información durante el registro.</p></details>
@@ -817,7 +1050,7 @@ function renderRegisterVerifyEmail() {
 }
 
 function renderJobSearch() {
-  const backRoute = hasProviderRegisterSession() ? "/register/experience" : "/register/verify-email";
+  const backRoute = "/register/verify-email";
   return registerShell(`
     <h1>¿Estás buscando empleo?</h1>
     <p class="form-copy">Tu respuesta nos ayudará a personalizar tu experiencia, pero solo tú podrás verla.</p>
@@ -825,7 +1058,7 @@ function renderJobSearch() {
       ${["Sí, estoy buscando empleo de forma activa", "Quizá, si encuentro la oportunidad adecuada", "No, ahora no me interesa"].map((text) => `<label class="radio-card"><input type="radio" name="jobSearch" value="${text}"/><span>${text}</span></label>`).join("")}
       ${navButtons(backRoute, true)}
     </form>
-  `, { skip: "/register/photo" });
+  `);
 }
 
 function renderJobPreferences() {
@@ -838,7 +1071,7 @@ function renderJobPreferences() {
       <label class="li-check"><input name="remote" type="checkbox"/> Me interesa teletrabajar</label>
       ${navButtons("/register/job-search", true)}
     </form>
-  `, { skip: "/register/photo" });
+  `);
 }
 
 function renderJobNotifications() {
@@ -850,7 +1083,7 @@ function renderJobNotifications() {
       <article class="option-card"><label class="li-check"><input type="checkbox" checked/> <b>Informa a los técnicos de selección sobre tu interés por nuevos empleos</b></label><div class="privacy-blue">Solo se mostrará según tus preferencias de privacidad. <a href="#">Más información sobre tu privacidad</a></div></article>
       ${navButtons("/register/job-preferences")}
     </form>
-  `, { skip: "/register/photo" });
+  `);
 }
 
 function renderPhoto() {
@@ -876,7 +1109,10 @@ function renderContacts() {
     <div class="gmail-art"><span>Gmail</span><i>XA</i><i>AR</i><i>CT</i><i>LM</i></div>
     <ul class="benefits"><li>&#128101; Vincula tus contactos de Gmail</li><li>&#128737; Elige quién puede conectar contigo</li><li>&#128200; Mira oportunidades de crecimiento</li></ul>
     <a class="blue-link" href="#">Más información</a>
-    <form data-form="contacts">${navButtons("/register/photo")}</form>
+    <form data-form="contacts">
+      <button class="oauth-btn wide" type="button" data-action="open-contacts-modal">Vincular contactos de Gmail</button>
+      ${navButtons("/register/photo")}
+    </form>
     <div class="google-modal" hidden data-google-modal>
       <section>
         <header>${googleIcon()} <b>Acceder con Google</b></header>
@@ -891,12 +1127,25 @@ function renderContacts() {
   `, { skip: "/register/app-download" });
 }
 
+const APP_DOWNLOAD_QR_URL = "/QR-LinkedinSimulacion.png";
+
 function renderAppDownload() {
   return registerShell(`
     <h1>Descarga la aplicación para llevar la delantera</h1>
-    <p class="form-copy">Lee las noticias de tu sector o habla con tus contactos sobre la marcha.</p>
+    <p class="form-copy">Lee las noticias de tu sector o habla con tus contactos sobre la marcha. Escanea el código QR para instalar la app.</p>
     <form data-form="app-download">
-      <div class="phone-qr"><span></span><div>${Array.from({ length: 49 }, (_, i) => `<i class="${i % 3 === 0 ? "on" : ""}"></i>`).join("")}</div></div>
+      <div class="phone-qr" aria-label="Vista previa del teléfono con código QR">
+        <span class="phone-notch" aria-hidden="true"></span>
+        <img
+          class="qr-image"
+          src="${APP_DOWNLOAD_QR_URL}"
+          alt="Código QR para descargar la aplicación de LinkedIn"
+          width="156"
+          height="156"
+          loading="eager"
+        />
+        <p class="qr-caption">Escanea para descargar</p>
+      </div>
       ${navButtons("/register/contacts")}
     </form>
   `);
@@ -1113,11 +1362,12 @@ function bindPageEvents() {
         return;
       }
 
-      if (provider === "microsoft") {
+      if (provider === "microsoft" || provider === "apple") {
+        showUnderImplementation(provider === "microsoft" ? "Microsoft" : "Apple", button);
         return;
       }
 
-      showComingSoon(provider === "apple" ? "Apple" : "Esta opcion", button);
+      showUnderImplementation("Esta opción", button);
     });
   });
 
@@ -1156,15 +1406,17 @@ function bindPageEvents() {
     saveRegister({ isStudent: event.target.checked });
     render();
   });
-  document.querySelector('[data-action="google-account"]')?.addEventListener("click", () => navigate("/register/app-download"));
+  document.querySelector('[data-action="open-contacts-modal"]')?.addEventListener("click", () => {
+    const modal = document.querySelector("[data-google-modal]");
+    if (modal) modal.hidden = false;
+  });
+  document.querySelector('[data-action="google-account"]')?.addEventListener("click", () => {
+    goToNextPostVerifyStep("/register/contacts");
+  });
   document.querySelector('[data-action="logout"]')?.addEventListener("click", logout);
 
-  if (location.pathname === "/register/verify-email") {
-    if (hasProviderRegisterSession()) {
-      sendCurrentVerificationCode(false).catch((error) => renderToast(registerErrorMessage(error)));
-    } else {
-      showEmailRegistrationUnavailable(document.querySelector('form[data-form="register-verify"] button[type="submit"]'));
-    }
+  if (location.pathname === "/register/verify-email" && hasActiveRegisterSession()) {
+    sendCurrentVerificationCode(false).catch((error) => renderToast(registerErrorMessage(error)));
   }
 
   const profilePhotoInput = document.getElementById("profilePhotoInput");
@@ -1283,12 +1535,20 @@ function bindPageEvents() {
 function bindForms() {
   const form = document.querySelector("form[data-form]");
   if (!form) return;
+  const syncJobSearchContinueButton = () => {
+    if (form.dataset.form !== "job-search") return;
+    const continueButton = form.querySelector(".step-actions button");
+    if (continueButton) continueButton.disabled = !form.querySelector('input[name="jobSearch"]:checked');
+  };
+
   form.addEventListener("input", () => {
     form.querySelectorAll("small[data-error]").forEach((small) => (small.textContent = ""));
     if (form.dataset.form === "register-verify") form.querySelector(".step-actions button").disabled = form.code.value.length < 6;
-    if (form.dataset.form === "job-search") form.querySelector(".step-actions button").disabled = !form.jobSearch.value;
+    syncJobSearchContinueButton();
     if (form.dataset.form === "job-preferences") form.querySelector(".step-actions button").disabled = !form.preferredJobs.value.trim() || !form.jobLocations.value.trim();
   });
+  form.addEventListener("change", syncJobSearchContinueButton);
+  syncJobSearchContinueButton();
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const submitButton = form.querySelector('button[type="submit"]');
@@ -1319,19 +1579,24 @@ async function handleForm(form) {
     "games"
   ]);
 
-  if (providerRegistrationRequiredForms.has(form.dataset.form) && !hasProviderRegisterSession()) {
-    showEmailRegistrationUnavailable(submitButton);
+  if (providerRegistrationRequiredForms.has(form.dataset.form) && !hasActiveRegisterSession()) {
+    renderToast("Inicia el registro con email o Google antes de continuar.");
     return;
   }
 
   const route = {
-    login: () => requireFields(form, ["email", "password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
-    welcome: () => requireFields(form, ["password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
-    forgot: () => {
-      if (!requireFields(form, ["email"])) return;
-      saveForgot({ email: data.email });
-      navigate("/forgot-password/verify");
+    login: async () => {
+      if (!requireFields(form, ["email", "password"])) return;
+      if (data.password.length < 8) return showError(form, "password", "Debe tener al menos 8 caracteres");
+      await completeLocalLogin(data.email, data.password, Boolean(data.remember));
     },
+    welcome: async () => {
+      if (!requireFields(form, ["password"])) return;
+      const email = store.remembered?.email;
+      if (!email) return renderToast("No encontramos el email recordado.");
+      await completeLocalLogin(email, data.password, true);
+    },
+    forgot: () => showUnderImplementation("La recuperación de contraseña", form.querySelector('button[type="submit"]')),
     "forgot-verify": () => /^\d{6}$/.test(data.code || "") ? navigate("/reset-password") : showError(form, "code", "Introduce 6 dígitos"),
     reset: () => {
       if (!requireFields(form, ["password", "confirm"])) return;
@@ -1344,34 +1609,65 @@ async function handleForm(form) {
     },
     "register-start": () => {
       if (!requireFields(form, ["email", "password"])) return;
-      replaceRegister({ email: data.email });
-      showEmailRegistrationUnavailable(form.querySelector('button[type="submit"]'));
+      if (data.password.length < 8) return showError(form, "password", "Debe tener al menos 8 caracteres");
+      replaceRegister({
+        authSource: "local",
+        email: data.email.trim(),
+        password: data.password
+      });
+      navigate("/register/name");
     },
     "register-name": async () => {
       if (!requireFields(form, ["firstName", "lastName"])) return;
-      saveRegister(data);
+      saveRegister({ ...data, authSource: store.register.authSource || "local" });
 
-      if (hasProviderRegisterSession()) {
+      if (hasActiveRegisterSession()) {
         const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
-        persistOnboardingState(onboarding);
+        persistOnboardingState(normalizeOnboardingStatus(onboarding));
+        saveRegister(advanceRegisterProgress("/register/name", store.register));
         navigate("/register/location");
         return;
       }
 
-      showEmailRegistrationUnavailable(form.querySelector('button[type="submit"]'));
-    },
-    "register-location": () => {
-      if (!requireFields(form, ["location"])) return;
-      saveRegister(data);
-      navigate("/register/experience");
-    },
-    "register-experience": () => {
-      saveRegister({ ...data, isStudent: Boolean(form.elements.isStudent?.checked) });
-      if (hasProviderRegisterSession()) {
-        navigate("/register/job-search");
+      if (!store.register.email || !store.register.password) {
+        renderToast("Completa el email y la contraseña en el paso anterior.");
+        navigate("/register");
         return;
       }
-      navigate("/register/verify-email");
+
+      const session = await registerLocalAccount(
+        buildLocalRegisterPayload(data.firstName, data.lastName)
+      );
+      persistExternalSession(session);
+      syncRegisterFromProviderSession(session, "local");
+      if (session.verificationMessage) renderToast(session.verificationMessage);
+      navigate(getRequiredRegisterPath(store.register, {
+        isLoggedIn: true,
+        onboarding: session.onboarding || {}
+      }));
+    },
+    "register-location": async () => {
+      if (!requireFields(form, ["location"])) return;
+      saveRegister(data);
+      saveRegister(advanceRegisterProgress("/register/location", store.register));
+      if (hasActiveRegisterSession()) {
+        const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+        persistOnboardingState(normalizeOnboardingStatus(onboarding));
+      }
+      navigate("/register/experience");
+    },
+    "register-experience": async () => {
+      saveRegister({ ...data, isStudent: Boolean(form.elements.isStudent?.checked) });
+      if (hasActiveRegisterSession()) {
+        const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+        persistOnboardingState(normalizeOnboardingStatus(onboarding));
+      }
+      const nextPath = getRouteAfterExperience(store.auth?.onboarding);
+      saveRegister(advanceRegisterProgress("/register/experience", store.register));
+      if (nextPath === "/register/job-search") {
+        saveRegister(markPostVerifyFlowStarted(store.register));
+      }
+      navigate(nextPath);
     },
     "register-verify": async () => {
       const code = (data.code || "").trim();
@@ -1382,8 +1678,11 @@ async function handleForm(form) {
 
       try {
         const response = await verifyEmailCode(userId, code);
-        const onboarding = responseValue(response, "onboarding", "Onboarding");
-        persistOnboardingState(onboarding);
+        persistOnboardingState(normalizeOnboardingStatus(response));
+        saveRegister({
+          ...markPostVerifyFlowStarted(store.register),
+          ...advanceRegisterProgress("/register/verify-email", store.register)
+        });
         navigate("/register/job-search");
       } catch (error) {
         if (error.status === 400 || error.status === 401) {
@@ -1394,35 +1693,54 @@ async function handleForm(form) {
       }
     },
     "job-search": async () => {
-      if (!data.jobSearch) return;
-      saveRegister(data);
-      if (data.jobSearch === "No, ahora no me interesa") {
-        if (hasProviderRegisterSession()) {
-          await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+      const selected = form.querySelector('input[name="jobSearch"]:checked');
+      if (!selected?.value) return;
+      saveRegister({ jobSearch: selected.value });
+      const skipJobPreferences = selected.value === "No, ahora no me interesa";
+      if (hasActiveRegisterSession()) {
+        try {
+          const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+          persistOnboardingState(normalizeOnboardingStatus(onboarding));
+        } catch (error) {
+          renderToast(registerErrorMessage(error));
+          return;
         }
-        navigate("/register/photo");
-        return;
       }
-
-      navigate("/register/job-preferences");
+      saveRegister(advanceRegisterProgress("/register/job-search", store.register));
+      const nextPath = getNextPostVerifyStep("/register/job-search", { skipJobPreferences });
+      navigate(nextPath);
     },
     "job-preferences": async () => {
       if (!requireFields(form, ["preferredJobs", "jobLocations"])) return;
       saveRegister({ ...data, remote: Boolean(form.elements.remote?.checked) });
-      if (hasProviderRegisterSession()) {
-        await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
-      }
-      navigate("/register/job-notifications");
-    },
-    "job-notifications": () => navigate("/register/photo"),
-    photo: () => navigate("/register/contacts"),
-    contacts: () => document.querySelector("[data-google-modal]").hidden = false,
-    "app-download": () => navigate("/register/games"),
-    games: async () => {
-      if (hasProviderRegisterSession()) {
+      if (hasActiveRegisterSession()) {
         const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
-        persistOnboardingState(onboarding);
+        persistOnboardingState(normalizeOnboardingStatus(onboarding));
       }
+      goToNextPostVerifyStep("/register/job-preferences");
+    },
+    "job-notifications": () => goToNextPostVerifyStep("/register/job-notifications"),
+    photo: async () => {
+      const file = document.getElementById("profilePhotoInput")?.files?.[0];
+      const userId = store.auth?.user?.id;
+      if (file && userId) {
+        const response = await uploadProfilePhoto(userId, file);
+        const profilePictureUrl = responseValue(response, "profilePictureUrl", "ProfilePictureUrl");
+        persistUploadedProfilePhoto(profilePictureUrl);
+      }
+      goToNextPostVerifyStep("/register/photo");
+    },
+    contacts: () => goToNextPostVerifyStep("/register/contacts"),
+    "app-download": () => goToNextPostVerifyStep("/register/app-download"),
+    games: async () => {
+      if (hasActiveRegisterSession()) {
+        const onboarding = await updateLocalRegisterProfile(
+          buildLocalProfileUpdatePayload({ completeOnboarding: true })
+        );
+        persistOnboardingState(normalizeOnboardingStatus(onboarding));
+      }
+
+      saveRegister({ postVerifyActive: false, postVerifyMaxStep: null, postVerifyMaxIndex: -1 });
 
       const profileUser = registeredUser();
       if (store.auth.user) {
@@ -1433,14 +1751,20 @@ async function handleForm(form) {
       }
       saveAuth();
       saveRemembered(store.auth.user || profileUser);
-      navigate(hasProviderRegisterSession() ? "/profile/me" : "/feed");
+      navigate(hasActiveRegisterSession() ? "/profile/me" : "/feed");
     }
   }[form.dataset.form];
   await route?.();
 }
 
 function routeView() {
-  const path = location.pathname;
+  let path = location.pathname;
+  const enforcedPath = enforceRegisterPath(path, store.register, store.auth);
+  if (enforcedPath !== path) {
+    history.replaceState({}, "", enforcedPath);
+    path = enforcedPath;
+  }
+
   const routes = {
     "/": renderLanding,
     "/login": renderLogin,
@@ -1464,7 +1788,7 @@ function routeView() {
     "/profile/me": renderProfile
   };
 
-  if (path === "/register/verify-email" && hasProviderRegisterSession()) {
+  if (path === "/register/verify-email" && !shouldShowEmailVerificationStep(store.auth?.onboarding)) {
     history.replaceState({}, "", "/register/job-search");
     return renderJobSearch();
   }
@@ -1480,7 +1804,7 @@ function routeView() {
     return (routes[pendingOnboardingRoute] || renderRegisterName)();
   }
 
-  if (shouldKeepLoggedInUserInApp(path, store.auth)) {
+  if (shouldKeepLoggedInUserInApp(path, store.auth, store.register)) {
     const redirectPath = pendingOnboardingRoute || "/feed";
     history.replaceState({}, "", redirectPath);
     return (routes[redirectPath] || renderFeed)();

@@ -1,12 +1,27 @@
-import { getOnboardingRoute, isOnboardingIncomplete } from "./onboardingFlow.js";
+import { isOnboardingIncomplete } from "./onboardingFlow.js";
+import { getRequiredRegisterPath, isBeforeEmailVerification } from "./registerFlow.js";
 
 export function shouldContinueRegistration(session) {
   return Boolean(session?.isNewUser) || isOnboardingIncomplete(session?.onboarding);
 }
 
-export function getPostLoginRoute(session, completedRoute = "/profile/me") {
+export function getPostLoginRoute(session, completedRoute = "/profile/me", register = {}) {
   if (!shouldContinueRegistration(session)) return completedRoute;
-  return getOnboardingRoute(session?.onboarding || {}, completedRoute);
+  return getRequiredRegisterPath(register, {
+    isLoggedIn: true,
+    onboarding: session?.onboarding || {}
+  });
+}
+
+
+/** Misma regla para correo y Google: verificar email antes de empleo/foto. */
+export function shouldShowEmailVerificationStep(_register = {}, onboarding = {}) {
+  return isBeforeEmailVerification(onboarding);
+}
+
+export function isOAuthRegisterSource(register = {}) {
+  const source = register?.authSource;
+  return source === "google" || source === "microsoft";
 }
 
 export function buildProviderRegisterDraft(session, currentDraft = {}, provider) {
