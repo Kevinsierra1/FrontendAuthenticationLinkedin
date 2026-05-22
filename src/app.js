@@ -9,7 +9,6 @@
 import {
   buildProviderRegisterDraft,
   getPostLoginRoute,
-  isProviderRegisterFlow,
   shouldContinueRegistration
 } from "./core/auth/authFlow.js";
 import {
@@ -96,8 +95,9 @@ function resolveProfileImageUrl(url) {
   return `${API_MEDIA_BASE_URL}${normalizedPath}`;
 }
 
-function isGoogleRegisterFlow() {
-  return isProviderRegisterFlow(store.register, "google");
+function hasProviderRegisterSession() {
+  const authSource = store.register?.authSource;
+  return Boolean(store.auth?.isLoggedIn && store.auth?.user?.id && authSource && authSource !== "local");
 }
 
 function getPendingOnboardingRoute() {
@@ -296,6 +296,12 @@ function renderInlineNotice(anchor, message) {
 
 function showComingSoon(provider = "Esta opcion", anchor = null) {
   const message = `${provider} se implementara pronto.`;
+  renderInlineNotice(anchor, message);
+  renderToast(message);
+}
+
+function showEmailRegistrationUnavailable(anchor = null) {
+  const message = "El registro con email necesita SMTP configurado. Por ahora usa Continuar con Google.";
   renderInlineNotice(anchor, message);
   renderToast(message);
 }
@@ -811,7 +817,7 @@ function renderRegisterVerifyEmail() {
 }
 
 function renderJobSearch() {
-  const backRoute = isGoogleRegisterFlow() ? "/register/experience" : "/register/verify-email";
+  const backRoute = hasProviderRegisterSession() ? "/register/experience" : "/register/verify-email";
   return registerShell(`
     <h1>¿Estás buscando empleo?</h1>
     <p class="form-copy">Tu respuesta nos ayudará a personalizar tu experiencia, pero solo tú podrás verla.</p>
@@ -1154,7 +1160,11 @@ function bindPageEvents() {
   document.querySelector('[data-action="logout"]')?.addEventListener("click", logout);
 
   if (location.pathname === "/register/verify-email") {
-    sendCurrentVerificationCode(false).catch((error) => renderToast(registerErrorMessage(error)));
+    if (hasProviderRegisterSession()) {
+      sendCurrentVerificationCode(false).catch((error) => renderToast(registerErrorMessage(error)));
+    } else {
+      showEmailRegistrationUnavailable(document.querySelector('form[data-form="register-verify"] button[type="submit"]'));
+    }
   }
 
   const profilePhotoInput = document.getElementById("profilePhotoInput");
@@ -1295,6 +1305,25 @@ function bindForms() {
 
 async function handleForm(form) {
   const data = Object.fromEntries(new FormData(form));
+  const submitButton = form.querySelector('button[type="submit"]');
+  const providerRegistrationRequiredForms = new Set([
+    "register-location",
+    "register-experience",
+    "register-verify",
+    "job-search",
+    "job-preferences",
+    "job-notifications",
+    "photo",
+    "contacts",
+    "app-download",
+    "games"
+  ]);
+
+  if (providerRegistrationRequiredForms.has(form.dataset.form) && !hasProviderRegisterSession()) {
+    showEmailRegistrationUnavailable(submitButton);
+    return;
+  }
+
   const route = {
     login: () => requireFields(form, ["email", "password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
     welcome: () => requireFields(form, ["password"]) && showComingSoon("El inicio de sesion con email", form.querySelector('button[type="submit"]')),
@@ -1315,21 +1344,21 @@ async function handleForm(form) {
     },
     "register-start": () => {
       if (!requireFields(form, ["email", "password"])) return;
-      saveRegister({ email: data.email });
-      showComingSoon("El registro con email", form.querySelector('button[type="submit"]'));
+      replaceRegister({ email: data.email });
+      showEmailRegistrationUnavailable(form.querySelector('button[type="submit"]'));
     },
     "register-name": async () => {
       if (!requireFields(form, ["firstName", "lastName"])) return;
       saveRegister(data);
 
-      if (store.auth?.isLoggedIn && store.auth?.user?.id) {
+      if (hasProviderRegisterSession()) {
         const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
         persistOnboardingState(onboarding);
         navigate("/register/location");
         return;
       }
 
-      showComingSoon("El registro con email", form.querySelector('button[type="submit"]'));
+      showEmailRegistrationUnavailable(form.querySelector('button[type="submit"]'));
     },
     "register-location": () => {
       if (!requireFields(form, ["location"])) return;
@@ -1338,7 +1367,7 @@ async function handleForm(form) {
     },
     "register-experience": () => {
       saveRegister({ ...data, isStudent: Boolean(form.elements.isStudent?.checked) });
-      if (isGoogleRegisterFlow()) {
+      if (hasProviderRegisterSession()) {
         navigate("/register/job-search");
         return;
       }
@@ -1368,7 +1397,7 @@ async function handleForm(form) {
       if (!data.jobSearch) return;
       saveRegister(data);
       if (data.jobSearch === "No, ahora no me interesa") {
-        if (store.auth?.user?.id) {
+        if (hasProviderRegisterSession()) {
           await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
         }
         navigate("/register/photo");
@@ -1380,7 +1409,7 @@ async function handleForm(form) {
     "job-preferences": async () => {
       if (!requireFields(form, ["preferredJobs", "jobLocations"])) return;
       saveRegister({ ...data, remote: Boolean(form.elements.remote?.checked) });
-      if (store.auth?.user?.id) {
+      if (hasProviderRegisterSession()) {
         await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
       }
       navigate("/register/job-notifications");
@@ -1390,7 +1419,7 @@ async function handleForm(form) {
     contacts: () => document.querySelector("[data-google-modal]").hidden = false,
     "app-download": () => navigate("/register/games"),
     games: async () => {
-      if (store.auth?.user?.id) {
+      if (hasProviderRegisterSession()) {
         const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
         persistOnboardingState(onboarding);
       }
@@ -1404,7 +1433,7 @@ async function handleForm(form) {
       }
       saveAuth();
       saveRemembered(store.auth.user || profileUser);
-      navigate(store.register.authSource === "google" ? "/profile/me" : "/feed");
+      navigate(hasProviderRegisterSession() ? "/profile/me" : "/feed");
     }
   }[form.dataset.form];
   await route?.();
@@ -1435,7 +1464,7 @@ function routeView() {
     "/profile/me": renderProfile
   };
 
-  if (path === "/register/verify-email" && isGoogleRegisterFlow()) {
+  if (path === "/register/verify-email" && hasProviderRegisterSession()) {
     history.replaceState({}, "", "/register/job-search");
     return renderJobSearch();
   }
