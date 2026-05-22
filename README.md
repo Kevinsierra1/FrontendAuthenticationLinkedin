@@ -2,6 +2,9 @@
 
 Simulador del flujo de autenticación y experiencia de usuario de LinkedIn. Desarrollado con **HTML5, CSS3 y JavaScript Vanilla ES6+**.
 
+### Web publica
+https://unchainable-keri-semiexternally.ngrok-free.dev/
+
 ---
 
 ## Requisitos Previos Obligatorios
@@ -63,7 +66,11 @@ VITE_ENV=development
 pnpm run dev
 ```
 
-La app abrirá en `http://localhost:4173`
+La app abrirá en `http://localhost:4173`.
+
+También está disponible públicamente en:
+
+- https://unchainable-keri-semiexternally.ngrok-free.dev/
 
 ---
 
