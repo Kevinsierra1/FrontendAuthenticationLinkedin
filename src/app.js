@@ -1,11 +1,32 @@
 ﻿import {
-  postGoogleExternalLogin,
-  registerLocalAccount,
+  cancelIncompleteRegistration,
+  postExternalLogin,
   sendEmailVerificationCode,
   updateLocalRegisterProfile,
   uploadProfilePhoto,
   verifyEmailCode
 } from "./services/authApi.js";
+import {
+  buildProviderRegisterDraft,
+  getPostLoginRoute,
+  isProviderRegisterFlow,
+  shouldContinueRegistration
+} from "./core/auth/authFlow.js";
+import {
+  getPendingOnboardingRoute as resolvePendingOnboardingRoute,
+  privateRoutes,
+  registerSteps,
+  shouldKeepLoggedInUserInApp
+} from "./core/auth/onboardingFlow.js";
+import {
+  clearAuthStorage,
+  persistAuth,
+  persistBackendSession,
+  persistForgot,
+  persistRegister,
+  persistRemembered,
+  readInitialAuthState
+} from "./core/auth/sessionPersistence.js";
 
 const demoUser = {
   name: "Ximena Afanador",
@@ -16,31 +37,6 @@ const demoUser = {
   company: "Campuslands"
 };
 
-const registerSteps = [
-  "/register",
-  "/register/name",
-  "/register/location",
-  "/register/experience",
-  "/register/verify-email",
-  "/register/job-search",
-  "/register/job-preferences",
-  "/register/job-notifications",
-  "/register/photo",
-  "/register/contacts",
-  "/register/app-download",
-  "/register/games"
-];
-
-const privateRoutes = new Set(["/feed", "/profile/me"]);
-const publicAuthRoutes = new Set([
-  "/",
-  "/login",
-  "/forgot-password",
-  "/forgot-password/verify",
-  "/reset-password",
-  "/reset-password/success"
-]);
-
 const appConfig = window.APP_CONFIG || {};
 const API_MEDIA_BASE_URL = (
   appConfig.VITE_API_BASE_URL ||
@@ -48,52 +44,38 @@ const API_MEDIA_BASE_URL = (
   "http://localhost:5152"
 ).replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = appConfig.VITE_GOOGLE_CLIENT_ID || appConfig.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
-const onboardingStepRouteMap = {
-  BasicProfile: "/register/name",
-  Location: "/register/location",
-  Experience: "/register/experience",
-  JobPreferences: "/register/job-preferences",
-  ProfilePhoto: "/register/photo",
-  PhoneVerification: "/register/verify-email",
-  Completed: "/profile/me"
-};
 
 let googleSignInInitialized = false;
 let googleCredentialResolver = null;
 let googleCredentialRejecter = null;
 let hiddenGoogleButtonElement = null;
 
-const store = {
-  auth: JSON.parse(localStorage.getItem("tl_auth") || '{"isLoggedIn":false,"user":null}'),
-  remembered: JSON.parse(localStorage.getItem("tl_remembered") || "null"),
-  register: JSON.parse(sessionStorage.getItem("tl_register") || "{}"),
-  forgot: JSON.parse(sessionStorage.getItem("tl_forgot") || "{}")
-};
+const store = readInitialAuthState();
 
 const app = document.querySelector("#app");
 
 function saveAuth() {
-  localStorage.setItem("tl_auth", JSON.stringify(store.auth));
+  persistAuth(store.auth);
 }
 
 function saveRemembered(user = demoUser) {
   store.remembered = user;
-  localStorage.setItem("tl_remembered", JSON.stringify(user));
+  persistRemembered(user);
 }
 
 function saveRegister(patch) {
   store.register = { ...store.register, ...patch };
-  sessionStorage.setItem("tl_register", JSON.stringify(store.register));
+  persistRegister(store.register);
 }
 
 function replaceRegister(nextState = {}) {
   store.register = { ...nextState };
-  sessionStorage.setItem("tl_register", JSON.stringify(store.register));
+  persistRegister(store.register);
 }
 
 function saveForgot(patch) {
   store.forgot = { ...store.forgot, ...patch };
-  sessionStorage.setItem("tl_forgot", JSON.stringify(store.forgot));
+  persistForgot(store.forgot);
 }
 
 function normalizeUserFromBackend(user = {}) {
@@ -114,21 +96,12 @@ function resolveProfileImageUrl(url) {
   return `${API_MEDIA_BASE_URL}${normalizedPath}`;
 }
 
-function getOnboardingRoute(onboarding = {}, completedRoute = "/profile/me") {
-  if (onboarding.completed || onboarding.currentStep === "Completed") return completedRoute;
-  return onboardingStepRouteMap[onboarding.currentStep] || "/register/name";
+function isGoogleRegisterFlow() {
+  return isProviderRegisterFlow(store.register, "google");
 }
 
-function canAccessRegisterRouteWhileLoggedIn(path) {
-  const onboarding = store.auth?.onboarding;
-  const onboardingIncomplete = Boolean(onboarding) && !onboarding.completed && onboarding.currentStep !== "Completed";
-  return onboardingIncomplete && registerSteps.includes(path);
-}
-
-function shouldKeepLoggedInUserInApp(path) {
-  if (!store.auth?.isLoggedIn || privateRoutes.has(path)) return false;
-  if (canAccessRegisterRouteWhileLoggedIn(path)) return false;
-  return publicAuthRoutes.has(path) || registerSteps.includes(path);
+function getPendingOnboardingRoute() {
+  return resolvePendingOnboardingRoute(store.auth, "/profile/me");
 }
 
 function persistExternalSession(session) {
@@ -146,35 +119,31 @@ function persistExternalSession(session) {
   };
   saveAuth();
   saveRemembered(userForUi);
-
-  localStorage.setItem("accessToken", session.accessToken || "");
-  localStorage.setItem("refreshToken", session.refreshToken || "");
-  localStorage.setItem("user", JSON.stringify(backendUser));
-  localStorage.setItem("onboarding", JSON.stringify(onboarding));
-  localStorage.setItem("isNewUser", String(Boolean(session.isNewUser)));
+  persistBackendSession(session, backendUser, onboarding);
 }
 
-function syncRegisterFromGoogleSession(session) {
-  const backendUser = session?.user || {};
+function persistOnboardingState(onboarding) {
+  if (!onboarding || !store.auth?.isLoggedIn) return;
 
-  replaceRegister({
-    authSource: "google",
-    email: backendUser.email || store.register.email || "",
-    firstName: backendUser.firstName || store.register.firstName || "",
-    lastName: backendUser.lastName || store.register.lastName || "",
-    location: store.register.location || "",
-    isStudent: Boolean(store.register.isStudent),
-    jobTitle: store.register.jobTitle || "",
-    company: store.register.company || "",
-    university: store.register.university || "",
-    degree: store.register.degree || "",
-    discipline: store.register.discipline || "",
-    startYear: store.register.startYear || "",
-    jobSearch: store.register.jobSearch || "",
-    preferredJobs: store.register.preferredJobs || "",
-    jobLocations: store.register.jobLocations || "",
-    remote: Boolean(store.register.remote)
-  });
+  store.auth.onboarding = onboarding;
+  saveAuth();
+  localStorage.setItem("onboarding", JSON.stringify(onboarding));
+}
+
+function clearSessionAndRegisterState({ clearRemembered = false } = {}) {
+  store.auth = { isLoggedIn: false, user: null };
+  store.register = {};
+  store.forgot = {};
+
+  saveAuth();
+  clearAuthStorage({ clearRemembered });
+  if (clearRemembered) {
+    store.remembered = null;
+  }
+}
+
+function syncRegisterFromProviderSession(session, provider) {
+  replaceRegister(buildProviderRegisterDraft(session, store.register, provider));
 }
 
 async function waitForGoogleIdentity(timeoutMs = 7000) {
@@ -377,10 +346,7 @@ async function sendCurrentVerificationCode(force = false) {
   const alreadyVerified = Boolean(responseValue(response, "alreadyVerified", "AlreadyVerified"));
 
   saveRegister({ verificationCodeSentFor: userId });
-  if (onboarding) {
-    store.auth.onboarding = onboarding;
-    saveAuth();
-  }
+  persistOnboardingState(onboarding);
 
   if (alreadyVerified) {
     renderToast("Tu email ya estaba verificado.");
@@ -432,37 +398,6 @@ function splitCsvList(value = "") {
     .filter(Boolean);
 }
 
-function buildLocalRegisterPayload() {
-  const firstName = (store.register.firstName || "").trim();
-  const lastName = (store.register.lastName || "").trim();
-  const location = (store.register.location || "").trim();
-  const isStudent = Boolean(store.register.isStudent);
-  const jobSearchStatus = parseJobSearchStatus(store.register.jobSearch || "");
-  const preferredTitles = splitCsvList(store.register.preferredJobs || "");
-  const preferredLocations = splitCsvList(store.register.jobLocations || "");
-
-  return {
-    email: (store.register.email || "").trim(),
-    password: store.register.password || "",
-    firstName,
-    lastName,
-    location: location || null,
-    isStudent,
-    jobTitle: (store.register.jobTitle || "").trim() || null,
-    company: (store.register.company || "").trim() || null,
-    university: (store.register.university || "").trim() || null,
-    degree: (store.register.degree || "").trim() || null,
-    discipline: (store.register.discipline || "").trim() || null,
-    startYear: store.register.startYear ? Number(store.register.startYear) : null,
-    jobSearchStatus,
-    preferredTitles,
-    preferredLocations,
-    remoteInterested: Boolean(store.register.remote),
-    jobAlertsEnabled: true,
-    recruiterVisibility: true
-  };
-}
-
 function buildLocalProfileUpdatePayload() {
   const authUserId = store.auth?.user?.id;
   return {
@@ -486,16 +421,19 @@ function buildLocalProfileUpdatePayload() {
   };
 }
 
-async function loginWithGoogle() {
-  const idToken = await requestGoogleIdToken();
-  const session = await postGoogleExternalLogin(idToken);
+async function requestProviderIdToken(provider) {
+  if (provider === "google") return requestGoogleIdToken();
+  throw new Error(`${provider} login unavailable`);
+}
+
+async function loginWithProvider(provider) {
+  const idToken = await requestProviderIdToken(provider);
+  const session = await postExternalLogin(provider, idToken);
   persistExternalSession(session);
-  const shouldCompleteProfile = Boolean(session.isNewUser) || !session.onboarding?.completed;
-  if (shouldCompleteProfile) {
-    syncRegisterFromGoogleSession(session);
+  if (shouldContinueRegistration(session)) {
+    syncRegisterFromProviderSession(session, provider);
   }
-  const redirectPath = getOnboardingRoute(session.onboarding, "/profile/me");
-  navigate(redirectPath);
+  navigate(getPostLoginRoute(session, "/profile/me"));
 }
 
 function login(user = demoUser) {
@@ -506,14 +444,23 @@ function login(user = demoUser) {
 }
 
 function logout() {
-  store.auth = { isLoggedIn: false, user: null };
-  saveAuth();
-  localStorage.removeItem("accessToken");
-  localStorage.removeItem("refreshToken");
-  localStorage.removeItem("user");
-  localStorage.removeItem("onboarding");
-  localStorage.removeItem("isNewUser");
+  clearSessionAndRegisterState();
   navigate("/");
+}
+
+async function cancelRegistration() {
+  const accessToken = localStorage.getItem("accessToken");
+  if (accessToken) {
+    try {
+      await cancelIncompleteRegistration();
+    } catch {
+      // Local cleanup still prevents access to incomplete profiles if the API is unavailable.
+    }
+  }
+
+  clearSessionAndRegisterState({ clearRemembered: true });
+  history.replaceState({}, "", "/");
+  render();
 }
 
 function navigate(path) {
@@ -536,7 +483,11 @@ function progress() {
   return index < 0 ? 0 : Math.round(((index + 1) / registerSteps.length) * 100);
 }
 
-function linkedinLogo() {
+function linkedinLogo({ cancelRegistrationFlow = false } = {}) {
+  if (cancelRegistrationFlow) {
+    return `<button type="button" class="li-logo logo-button" data-action="cancel-registration" aria-label="Cancelar registro y volver al inicio"><span>Linked</span><b>in</b></button>`;
+  }
+
   return `<a href="/" class="li-logo" data-link><span>Linked</span><b>in</b></a>`;
 }
 
@@ -756,7 +707,7 @@ function registerShell(content, options = {}) {
   return `
     <div class="register-progress"><span style="width:${progress()}%"></span></div>
     <main class="register-page">
-      <div class="register-top">${linkedinLogo()}${options.skip ? `<a href="${options.skip}" data-link>Omitir</a>` : ""}</div>
+      <div class="register-top">${linkedinLogo({ cancelRegistrationFlow: true })}${options.skip ? `<a href="${options.skip}" data-link>Omitir</a>` : ""}</div>
       <section class="register-panel slide-in">${content}</section>
     </main>
   `;
@@ -860,12 +811,13 @@ function renderRegisterVerifyEmail() {
 }
 
 function renderJobSearch() {
+  const backRoute = isGoogleRegisterFlow() ? "/register/experience" : "/register/verify-email";
   return registerShell(`
     <h1>¿Estás buscando empleo?</h1>
     <p class="form-copy">Tu respuesta nos ayudará a personalizar tu experiencia, pero solo tú podrás verla.</p>
     <form data-form="job-search">
       ${["Sí, estoy buscando empleo de forma activa", "Quizá, si encuentro la oportunidad adecuada", "No, ahora no me interesa"].map((text) => `<label class="radio-card"><input type="radio" name="jobSearch" value="${text}"/><span>${text}</span></label>`).join("")}
-      ${navButtons("/register/verify-email", true)}
+      ${navButtons(backRoute, true)}
     </form>
   `, { skip: "/register/photo" });
 }
@@ -1125,6 +1077,13 @@ function requireFields(form, names) {
 }
 
 function bindPageEvents() {
+  document.querySelector('[data-action="cancel-registration"]')?.addEventListener("click", async (event) => {
+    event.preventDefault();
+    const button = event.currentTarget;
+    button.disabled = true;
+    await cancelRegistration();
+  });
+
   document.querySelectorAll("[data-link]").forEach((link) => {
     link.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1139,7 +1098,7 @@ function bindPageEvents() {
       if (provider === "google") {
         button.disabled = true;
         try {
-          await loginWithGoogle();
+          await loginWithProvider(provider);
         } catch (error) {
           renderToast(googleLoginErrorMessage(error));
         } finally {
@@ -1356,24 +1315,21 @@ async function handleForm(form) {
     },
     "register-start": () => {
       if (!requireFields(form, ["email", "password"])) return;
-      saveRegister({ email: data.email, password: data.password });
-      navigate("/register/name");
+      saveRegister({ email: data.email });
+      showComingSoon("El registro con email", form.querySelector('button[type="submit"]'));
     },
     "register-name": async () => {
       if (!requireFields(form, ["firstName", "lastName"])) return;
       saveRegister(data);
 
-      if (store.register.authSource === "google" && store.auth?.user?.id) {
-        await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+      if (store.auth?.isLoggedIn && store.auth?.user?.id) {
+        const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
+        persistOnboardingState(onboarding);
         navigate("/register/location");
         return;
       }
 
-      const registerPayload = buildLocalRegisterPayload();
-      const session = await registerLocalAccount(registerPayload);
-      persistExternalSession(session);
-
-      navigate("/register/location");
+      showComingSoon("El registro con email", form.querySelector('button[type="submit"]'));
     },
     "register-location": () => {
       if (!requireFields(form, ["location"])) return;
@@ -1382,6 +1338,10 @@ async function handleForm(form) {
     },
     "register-experience": () => {
       saveRegister({ ...data, isStudent: Boolean(form.elements.isStudent?.checked) });
+      if (isGoogleRegisterFlow()) {
+        navigate("/register/job-search");
+        return;
+      }
       navigate("/register/verify-email");
     },
     "register-verify": async () => {
@@ -1394,11 +1354,7 @@ async function handleForm(form) {
       try {
         const response = await verifyEmailCode(userId, code);
         const onboarding = responseValue(response, "onboarding", "Onboarding");
-        if (onboarding) {
-          store.auth.onboarding = onboarding;
-          saveAuth();
-          localStorage.setItem("onboarding", JSON.stringify(onboarding));
-        }
+        persistOnboardingState(onboarding);
         navigate("/register/job-search");
       } catch (error) {
         if (error.status === 400 || error.status === 401) {
@@ -1436,9 +1392,7 @@ async function handleForm(form) {
     games: async () => {
       if (store.auth?.user?.id) {
         const onboarding = await updateLocalRegisterProfile(buildLocalProfileUpdatePayload());
-        if (store.auth.onboarding) {
-          store.auth.onboarding = onboarding;
-        }
+        persistOnboardingState(onboarding);
       }
 
       const profileUser = registeredUser();
@@ -1458,17 +1412,6 @@ async function handleForm(form) {
 
 function routeView() {
   const path = location.pathname;
-
-  if (privateRoutes.has(path) && !store.auth.isLoggedIn) {
-    history.replaceState({}, "", "/login");
-    return renderLogin();
-  }
-
-  if (shouldKeepLoggedInUserInApp(path)) {
-    history.replaceState({}, "", "/feed");
-    return renderFeed();
-  }
-
   const routes = {
     "/": renderLanding,
     "/login": renderLogin,
@@ -1492,10 +1435,33 @@ function routeView() {
     "/profile/me": renderProfile
   };
 
+  if (path === "/register/verify-email" && isGoogleRegisterFlow()) {
+    history.replaceState({}, "", "/register/job-search");
+    return renderJobSearch();
+  }
+
+  if (privateRoutes.has(path) && !store.auth.isLoggedIn) {
+    history.replaceState({}, "", "/login");
+    return renderLogin();
+  }
+
+  const pendingOnboardingRoute = getPendingOnboardingRoute();
+  if (pendingOnboardingRoute && !registerSteps.includes(path)) {
+    history.replaceState({}, "", pendingOnboardingRoute);
+    return (routes[pendingOnboardingRoute] || renderRegisterName)();
+  }
+
+  if (shouldKeepLoggedInUserInApp(path, store.auth)) {
+    const redirectPath = pendingOnboardingRoute || "/feed";
+    history.replaceState({}, "", redirectPath);
+    return (routes[redirectPath] || renderFeed)();
+  }
+
   const view = routes[path];
   if (!view && store.auth.isLoggedIn) {
-    history.replaceState({}, "", "/feed");
-    return renderFeed();
+    const redirectPath = pendingOnboardingRoute || "/feed";
+    history.replaceState({}, "", redirectPath);
+    return (routes[redirectPath] || renderFeed)();
   }
 
   return (view || renderLanding)();

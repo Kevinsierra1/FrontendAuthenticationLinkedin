@@ -61,20 +61,24 @@ async function requestFormData(path, formData, fallbackMessage) {
   throw toApiError(response.status, payload, fallbackMessage);
 }
 
-export async function postGoogleExternalLogin(idToken) {
+export async function postExternalLogin(provider, idToken) {
   if (typeof idToken !== "string" || !idToken.trim()) {
-    throw toApiError(400, {}, "Missing Google idToken");
+    throw toApiError(400, {}, `Missing ${provider} idToken`);
   }
 
   return requestJson(
-    "/auth/external-login/google",
+    `/auth/external-login/${provider}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ idToken: idToken.trim() })
     },
-    "Google login failed"
+    `${provider} login failed`
   );
+}
+
+export async function postGoogleExternalLogin(idToken) {
+  return postExternalLogin("google", idToken);
 }
 
 export async function registerLocalAccount(payload) {
@@ -122,6 +126,20 @@ export async function verifyEmailCode(userId, code) {
       body: JSON.stringify({ userId, code })
     },
     "Email verification failed"
+  );
+}
+
+export async function cancelIncompleteRegistration() {
+  const accessToken = localStorage.getItem("accessToken");
+  if (!accessToken) return {};
+
+  return requestJson(
+    "/auth/register/cancel",
+    {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${accessToken}` }
+    },
+    "Registration cancel failed"
   );
 }
 

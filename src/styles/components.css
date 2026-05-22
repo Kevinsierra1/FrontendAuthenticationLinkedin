@@ -43,6 +43,12 @@ a:hover {
   line-height: 1;
 }
 .li-logo:hover { text-decoration: none; }
+.logo-button {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
 .li-logo b,
 .li-icon {
   display: inline-grid;
